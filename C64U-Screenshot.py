@@ -51,6 +51,9 @@ COPY_BUFFER_SIZE = 0x2000  # 8KB
 # Stub routine location (a small area for our injected code)
 STUB_ADDR = 0x0340  # Cassette buffer area, usually safe
 
+COPY_COMPLETE_MARKER = 0x42
+COPY_RELEASE_MARKER = 0x99
+
 
 class Ultimate64API:
     """Interface to Ultimate 64 REST API"""
@@ -180,7 +183,8 @@ def check_rom_overlap(address, length):
     return None
 
 
-def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None):
+def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None, return_with_rti=False,
+                       wait_for_release=False):
     """
     Generate 6502 machine code to copy memory with ROMs banked out.
     
@@ -190,7 +194,8 @@ def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None):
     3. Copies 'length' bytes from src_addr to dst_addr
     4. Restores $01 and registers
     5. Sets completion marker
-    6. Jumps to jmp_target (original NMI handler) or loops if None
+    6. Optionally waits for the host to release it
+    7. Returns from NMI with RTI, jumps to jmp_target, or loops if neither is set
     
     Returns: bytes of machine code
     """
@@ -247,10 +252,19 @@ def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None):
     # Restore $01
     code.extend([0x68])                    # PLA
     code.extend([0x85, 0x01])              # STA $01
-    
+
     # Set completion marker
-    code.extend([0xA9, 0x42])              # LDA #$42 (marker value)
+    code.extend([0xA9, COPY_COMPLETE_MARKER])  # LDA #marker
     code.extend([0x85, 0x02])              # STA $02 (store marker at $02)
+
+    if wait_for_release:
+        # Keep the CPU inside the NMI until the host has read the buffer and
+        # restored the memory that was temporarily overwritten.
+        wait_loop = len(code)
+        code.extend([0xA5, 0x02])          # LDA $02
+        code.extend([0xC9, COPY_RELEASE_MARKER])  # CMP #release_marker
+        branch_offset = (wait_loop - (len(code) + 2)) & 0xFF
+        code.extend([0xD0, branch_offset]) # BNE wait_loop
     
     # Restore registers (in reverse order of saving)
     code.extend([0x68])                    # PLA - restore Y
@@ -259,7 +273,10 @@ def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None):
     code.extend([0xAA])                    # TAX
     code.extend([0x68])                    # PLA - restore A
     
-    if jmp_target is not None:
+    if return_with_rti:
+        # Return directly from the NMI without running the program's handler.
+        code.extend([0x40])                    # RTI
+    elif jmp_target is not None:
         # Jump to original handler (e.g., Kernal NMI handler)
         # This lets the original handler do proper RTI
         code.extend([0x4C, jmp_target & 0xFF, (jmp_target >> 8) & 0xFF])
@@ -285,6 +302,10 @@ def read_memory_via_copy(api, src_addr, length, vic):
     6. Restore all modified memory
     """
     print(f"  ROM bypass: Copying ${src_addr:04X}-${src_addr+length-1:04X} to buffer at ${COPY_BUFFER:04X}")
+    copy_length = ((length + 255) // 256) * 256
+    if copy_length > COPY_BUFFER_SIZE:
+        print(f"  Error: Copy length {copy_length} exceeds buffer size {COPY_BUFFER_SIZE}")
+        return None
     
     # Step 1: Back up memory we'll modify
     # - The stub area (copy routine)
@@ -301,7 +322,7 @@ def read_memory_via_copy(api, src_addr, length, vic):
         return None
     
     # Save buffer area
-    buffer_backup = api.read_memory(COPY_BUFFER, length)
+    buffer_backup = api.read_memory(COPY_BUFFER, copy_length)
     if buffer_backup is None:
         print("  Error: Failed to backup buffer area")
         return None
@@ -325,17 +346,23 @@ def read_memory_via_copy(api, src_addr, length, vic):
     original_nmi_handler = nmi_vector_backup[0] + (nmi_vector_backup[1] << 8)
     print(f"  Original NMI handler: ${original_nmi_handler:04X}")
     
-    # Also backup CIA2 state for NMI triggering
-    cia2_icr_backup = api.read_memory(0xDD0D, 1)
-    cia2_timer_backup = api.read_memory(0xDD04, 3)  # Timer A low, high, control
+    # Also backup CIA2 Timer A state for NMI triggering
+    cia2_timer_backup = api.read_memory(0xDD04, 2)  # Timer A low, high
+    cia2_timer_ctrl_backup = api.read_memory(0xDD0E, 1)  # Timer A control
+    buffer_restored = False
+    zp_restored = False
+    nmi_vector_restored = False
+    release_sent = False
+    marker = None
     
     try:
-        # Step 2: Generate copy routine that jumps to original NMI handler when done
+        # Step 2: Generate copy routine that returns directly from the NMI when done
         print("  Injecting copy routine...")
-        copy_code = generate_copy_stub(src_addr, COPY_BUFFER, length, jmp_target=original_nmi_handler)
+        copy_code = generate_copy_stub(src_addr, COPY_BUFFER, length,
+                                       return_with_rti=True, wait_for_release=True)
         print(f"    Stub size: {len(copy_code)} bytes at ${STUB_ADDR:04X}")
         print(f"    Copy: ${src_addr:04X} -> ${COPY_BUFFER:04X}, {length} bytes ({(length+255)//256} pages)")
-        print(f"    Will jump to original handler at ${original_nmi_handler:04X} when done")
+        print("    Will wait in NMI until copied data has been read")
         
         if not api.write_memory(STUB_ADDR, copy_code):
             print("  Error: Failed to write copy routine")
@@ -368,8 +395,9 @@ def read_memory_via_copy(api, src_addr, length, vic):
         # Enable Timer A NMI: write $81 to ICR (bit 7=set, bit 0=Timer A)
         api.write_memory(0xDD0D, bytes([0x81]))
         
-        # Start Timer A with force load: $11 = bit 0 (start) + bit 4 (force load)
-        api.write_memory(0xDD0E, bytes([0x11]))
+        # Start Timer A as one-shot with force load:
+        # $19 = bit 0 (start) + bit 3 (one-shot) + bit 4 (force load)
+        api.write_memory(0xDD0E, bytes([0x19]))
         
         # Step 5: Resume and wait for copy to complete
         print("  Executing copy routine...")
@@ -377,20 +405,23 @@ def read_memory_via_copy(api, src_addr, length, vic):
             print("  Error: Failed to resume machine")
             return None
         
-        # Wait for the copy to complete
-        # 8KB copy at 1MHz takes ~100ms, so 500ms should be plenty
-        time.sleep(0.5)
-        
-        # Now pause and check if it completed
-        api.pause()
-        
-        marker = api.read_memory(0x02, 1)
-        
-        if marker and marker[0] == 0x42:
+        # Wait for the copy to complete. The injected NMI keeps the CPU in a
+        # wait loop after setting the marker, so the interrupted program cannot
+        # touch the temporary buffer before we read it.
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
+            time.sleep(0.001)
+            marker = api.read_memory(0x02, 1)
+            if marker and marker[0] == COPY_COMPLETE_MARKER:
+                break
+
+        if marker and marker[0] == COPY_COMPLETE_MARKER:
             print("  Copy complete (marker verified)")
-            print("  Original NMI handler returned control to program")
+            print("  Injected NMI is waiting while copied data is read")
         else:
-            print(f"  Warning: Copy may have issues (marker={marker[0] if marker else 'None':02X}, expected 42)")
+            api.pause()
+            print(f"  Warning: Copy may have issues (marker={marker[0] if marker else 'None':02X}, expected {COPY_COMPLETE_MARKER:02X})")
+            return None
         
         # Step 5: Read the copied data from buffer
         print("  Reading copied data from buffer...")
@@ -399,12 +430,37 @@ def read_memory_via_copy(api, src_addr, length, vic):
         if copied_data is None:
             print("  Error: Failed to read copied data")
             return None
+
+        # Restore volatile memory before the interrupted program can run again.
+        print("  Restoring buffer before releasing NMI...")
+        buffer_restored = api.write_memory(COPY_BUFFER, buffer_backup)
+        zp_restored = api.write_memory(0xFB, zp_backup)
+        nmi_vector_restored = api.write_memory(0x0318, nmi_vector_backup)
+
+        if not api.write_memory(0x02, bytes([COPY_RELEASE_MARKER])):
+            print("  Error: Failed to release injected NMI")
+            return None
+        release_sent = True
+        time.sleep(0.001)
+        api.pause()
+        print("  Injected NMI released control to program")
         
         return copied_data
         
     finally:
         # Step 6: Restore all modified memory
         print("  Restoring original memory...")
+
+        if marker and marker[0] == COPY_COMPLETE_MARKER and not release_sent:
+            if not buffer_restored:
+                buffer_restored = api.write_memory(COPY_BUFFER, buffer_backup)
+            if not zp_restored:
+                zp_restored = api.write_memory(0xFB, zp_backup)
+            if not nmi_vector_restored:
+                nmi_vector_restored = api.write_memory(0x0318, nmi_vector_backup)
+            api.write_memory(0x02, bytes([COPY_RELEASE_MARKER]))
+            api.resume()
+            time.sleep(0.001)
         
         # Make sure we're paused
         api.pause()
@@ -412,15 +468,20 @@ def read_memory_via_copy(api, src_addr, length, vic):
         # Disable CIA2 Timer A NMI
         api.write_memory(0xDD0D, bytes([0x01]))  # Clear Timer A NMI enable
         
-        # Restore CIA2 timer state
+        # Acknowledge any pending CIA2 interrupt and restore Timer A state
+        api.read_memory(0xDD0D, 1)
         if cia2_timer_backup:
             api.write_memory(0xDD04, cia2_timer_backup)
+        if cia2_timer_ctrl_backup:
+            api.write_memory(0xDD0E, cia2_timer_ctrl_backup)
         
         # Restore NMI vector
-        api.write_memory(0x0318, nmi_vector_backup)
+        if not nmi_vector_restored:
+            api.write_memory(0x0318, nmi_vector_backup)
         
         # Restore zero page
-        api.write_memory(0xFB, zp_backup)
+        if not zp_restored:
+            api.write_memory(0xFB, zp_backup)
         
         # Restore marker
         if marker_backup:
@@ -430,7 +491,8 @@ def read_memory_via_copy(api, src_addr, length, vic):
         api.write_memory(STUB_ADDR, stub_backup)
         
         # Restore buffer area
-        api.write_memory(COPY_BUFFER, buffer_backup)
+        if not buffer_restored:
+            api.write_memory(COPY_BUFFER, buffer_backup)
         
         print("  Memory restored")
 
@@ -449,7 +511,6 @@ def read_memory_smart(api, address, length, vic):
     rom_name, overlap_start, overlap_end, rom_base, rom_size = overlap
     print(f"  Detected {rom_name} ROM overlap at ${overlap_start:04X}-${overlap_end:04X}")
     
-    # Use the ROM bypass copy routine
     return read_memory_via_copy(api, address, length, vic)
 
 
