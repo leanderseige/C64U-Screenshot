@@ -747,8 +747,8 @@ def add_border(img, border_color, border_size=32):
     return bordered
 
 
-def get_embedded_charset():
-    """Return the standard C64 character ROM (uppercase/graphics set)"""
+def get_embedded_charset(char_mem_offset=0x1000):
+    """Return the standard C64 character ROM set for the given VIC offset"""
     chars = {
         0: [0x3C, 0x66, 0x6E, 0x6E, 0x60, 0x62, 0x3C, 0x00],
         1: [0x18, 0x3C, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00],
@@ -886,9 +886,46 @@ def get_embedded_charset():
             offset = code * 8
             for i, byte in enumerate(pattern):
                 charset[offset + i] = byte
-    
+
+    if char_mem_offset >= 0x1800:
+        lower_upper_normal = bytes.fromhex(
+            "3c666e6e60623c0000003c063e663e000060607c66667c0000003c6060603c00"
+            "0006063e66663e0000003c667e603c00000e183e1818180000003e66663e067c"
+            "0060607c666666000018003818183c00000600060606063c0060606c786c6600"
+            "0038181818183c000000667f7f6b630000007c666666660000003c6666663c00"
+            "00007c66667c606000003e66663e060600007c666060600000003e603c067c00"
+            "00187e1818180e000000666666663e0000006666663c18000000636b7f3e3600"
+            "0000663c183c660000006666663e0c7800007e0c18307e003c30303030303c00"
+            "0c12307c3062fc003c0c0c0c0c0c3c0000183c7e181818180010307f7f301000"
+            "0000000000000000181818180000180066666600000000006666ff66ff666600"
+            "183e603c067c180062660c18306646003c663c3867663f00060c180000000000"
+            "0c18303030180c0030180c0c0c18300000663cff3c6600000018187e18180000"
+            "00000000001818300000007e0000000000000000001818000003060c18306000"
+            "3c666e7666663c001818381818187e003c66060c30607e003c66061c06663c00"
+            "060e1e667f0606007e607c0606663c003c66607c66663c007e660c1818181800"
+            "3c66663c66663c003c66663e06663c0000001800001800000000180000181830"
+            "0e18306030180e0000007e007e00000070180c060c1870003c66060c18001800"
+            "000000ffff000000183c667e666666007c66667c66667c003c66606060663c00"
+            "786c6666666c78007e60607860607e007e606078606060003c66606e66663c00"
+            "6666667e666666003c18181818183c001e0c0c0c0c6c3800666c7870786c6600"
+            "6060606060607e0063777f6b6363630066767e7e6e6666003c66666666663c00"
+            "7c66667c606060003c666666663c0e007c66667c786c66003c66603c06663c00"
+            "7e181818181818006666666666663c0066666666663c18006363636b7f776300"
+            "66663c183c6666006666663c181818007e060c1830607e00181818ffff181818"
+            "c0c03030c0c0303018181818181818183333cccc3333cccc3399cc663399cc66"
+            "0000000000000000f0f0f0f0f0f0f0f000000000ffffffffff00000000000000"
+            "00000000000000ffc0c0c0c0c0c0c0c0cccc3333cccc33330303030303030303"
+            "00000000cccc3333cc993366cc99336603030303030303031818181f1f181818"
+            "000000000f0f0f0f1818181f1f000000000000f8f8181818000000000000ffff"
+            "0000001f1f181818181818ffff000000000000ffff181818181818f8f8181818"
+            "c0c0c0c0c0c0c0c0e0e0e0e0e0e0e0e00707070707070707ffff000000000000"
+            "ffffff00000000000000000000ffffff0103066c7870600000000000f0f0f0f0"
+            "0f0f0f0f00000000181818f8f8000000f0f0f0f000000000f0f0f0f00f0f0f0f"
+        )
+        charset[:1024] = lower_upper_normal
+
     for i in range(1024):
-        charset[1024 + i] = charset[i]
+        charset[1024 + i] = charset[i] ^ 0xFF
     
     return bytes(charset)
 
@@ -960,8 +997,13 @@ def capture_screenshot(ip_address, output_file="screenshot.png", add_border_flag
             
             if uses_char_rom:
                 print("Reading Character ROM...")
-                print("  Using embedded C64 character ROM")
-                char_rom = get_embedded_charset()
+                charset_name = (
+                    "uppercase/lowercase"
+                    if char_addr_in_bank >= 0x1800 else
+                    "uppercase/graphics"
+                )
+                print(f"  Using embedded C64 character ROM ({charset_name})")
+                char_rom = get_embedded_charset(char_addr_in_bank)
             else:
                 print(f"Reading Character Memory at ${vic.char_mem_addr:04X}...")
                 if use_rom_bypass:
@@ -1137,4 +1179,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
